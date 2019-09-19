@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 import math
-import os, re
+import os, re, random
 import tensorflow as tf
 import numpy as np
 import pandas as pd
@@ -351,14 +351,14 @@ class InstaCaptionGeneratorTrain():
 
     def build_generator(self, maxlen, batchsize=1):
         # same setup as `build_model` function
-        img = tf.placeholder(tf.float32, [self.batch_size, self.dim_in])
+        img = tf.placeholder(tf.float32, [batchsize, self.dim_in])
         image_embedding = tf.matmul(img, self.img_embedding) + self.img_embedding_bias
         state = self.lstm.zero_state(batchsize, dtype=tf.float32)
 
         # list to hold the words of our generated captions
         all_words = []
 
-        with tf.variable_scope("RNN"):
+        with tf.variable_scope("RNN", reuse=True):
             # First pass in image embedding
             output, state = self.lstm(image_embedding, state)
 
@@ -502,6 +502,20 @@ def train(lrate=0.075, continue_training=False, transfer=True):
                 file_writer.add_summary(summary, global_step=epoch)
                 print("Current Cost: ", loss_value, "\t Epoch {}/{}".format(epoch, n_epochs))
 
+                # Test and generate text with model 3 times
+                for i in range(3):
+                    rnd_idx = random.sample(index, 1)
+                    X = feats[rnd_idx]
+                    Y = captions[rnd_idx]
+                    max_gen_len = 15
+                    test_im, generated_words = caption_generator.build_generator(maxlen=max_gen_len, batchsize=1)
+                    generated_word_index = sess.run(generated_words, feed_dict={test_im: X})
+                    generated_word_index = np.hstack(generated_word_index)
+                    generated_words = [ixtoword[x] for x in generated_word_index]
+                    generated_words = [w for w in generated_words if w != "."]
+                    generated_sentence = ' '.join(generated_words)
+                    print("ACTUAL: {}\nPREDICTED: {}\n".format(Y, generated_sentence))
+
                 # if len(losses) >= 10 and all(elem == losses[-1] for elem in losses[:-10:-1]):
                 #     use_adaptive_lrate = True
 
@@ -514,14 +528,14 @@ def train(lrate=0.075, continue_training=False, transfer=True):
 
 def run_training_loop():
     try:
-        #train(.01,False,False) #train from scratch
+        train(.001,False,False) #train from scratch
         #train(.001,True,True)    #continue training from pretrained weights @epoch500
-        train(.001,True,False)  #train from previously saved weights
+        #train(.001,True,False)  #train from previously saved weights
     except KeyboardInterrupt:
         print('Exiting Training')
 
 def generate_caption_for_image_with_path(image_path, max_gen_len=15):
-    if not os.path.exists('data/ixtoword.npy'):
+    if not os.path.exists('data/insta_ixtoword.npy'):
         print ('You must run a training loop for at least one epoch first.')
     else:
         tf.reset_default_graph()
@@ -566,7 +580,7 @@ def generate_caption_for_image_with_path(image_path, max_gen_len=15):
         print(generated_sentence)
 
 if __name__ == "__main__":
-    #generate_caption_for_image_with_path("data/images/c.jpg")
+    #generate_caption_for_image_with_path("data/images/insta_5.jpg")
 
 
     #create_vgg_dataset("/Users/Odie/Downloads/instagram-scraper-master/instagram_scraper/foodposts")
