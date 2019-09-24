@@ -12,12 +12,13 @@ from collections import Counter
 from nltk.tokenize import TweetTokenizer
 import tables
 
+
 model_path = './models/tensorflow_insta'
 model_path_transfer = './models/tf_final_insta'
-feature_path_vgg = './data/insta_features_vgg.h5'
-annotation_path = './data/insta_captions.npy'
+feature_path_vgg = './data/insta_features_vgg2.h5'
+annotation_path = './data/insta_captions2.npy'
 vgg_path = './data/vgg16-20160129.tfmodel'
-idx2word_path = 'data/insta_ixtoword.npy'
+idx2word_path = 'data/insta_ixtoword2_thresh2.npy'
 logdir = "models/tensorflow_insta/logs/t2_lrate_4e-2"
 
 ### Hyperparameters ###
@@ -25,9 +26,9 @@ WORD_COUNT_THRESHOLD_FOR_VOCAB = 2
 dim_embed = 512 # size of image embedding
 dim_hidden = 512 # number of neurons in RNN
 dim_in = 4096 # flattened CNN image feature size
-batch_size = 128
+batch_size = 512
 momentum = 0.9
-n_epochs = 500
+n_epochs = 150
 eval_epoch_interval = 1
 
 ### Helper Functions ###
@@ -54,7 +55,7 @@ def removePunctuation(text):
         else:
             a=0
     text=text.lower()
-    return re.sub('[^#@0-9a-zA-Z\\U\\u\\ ]', '', text.encode('unicode_escape')) # includes hashtags and @
+    return re.sub('[^#@.0-9a-zA-Z\\U\\u\\ ]', '', text.encode('unicode_escape')) # includes hashtags and @
 
 def emoji_tokenize(text):
     emoji_pattern = re.compile(
@@ -120,67 +121,6 @@ def load_numpy_array(save_path):
     f.close()
     return arr
 
-def create_vgg_dataset(image_directory):
-    # initialize the data and labels
-    images = []
-    captions = []
-
-    # Get captions and total number of images in folder
-    for filename in os.listdir(image_directory):
-        if filename != ".DS_Store":
-            caption_text = filename[:-4]
-            captions.append(caption_text)
-
-    # Load images and captions
-    n_images = len(captions)
-    print(n_images)
-    batches = 0
-    step_size = 2000
-    image_start = 0
-    image_stop = image_start+step_size
-    while batches < n_images:
-        for filename in os.listdir(image_directory)[image_start:image_stop]:
-            if filename != ".DS_Store":
-                images.append(load_image(os.path.join(image_directory, filename),224))
-
-        # Prepare for numpy
-        images = np.array(images, dtype="float")
-
-        tf.reset_default_graph()
-
-        # Load pretrained VGG16
-        with open(vgg_path, 'rb') as f:
-            fileContent = f.read()
-            graph_def = tf.GraphDef()
-            graph_def.ParseFromString(fileContent)
-
-        # Placeholder for VGG16's expected input
-        input = tf.placeholder("float32", [45, 224, 224, 3])
-        tf.import_graph_def(graph_def, input_map={"images": input})
-
-        graph = tf.get_default_graph()
-        sess = tf.InteractiveSession(graph=graph)
-
-        # Create file if not exists
-        if not os.path.exists(feature_path_vgg):
-            feat_file = tables.open_file(feature_path_vgg, mode='w')
-            atom = tables.Float32Atom()
-            array_c = feat_file.create_earray(feat_file.root, 'data', atom, (0, dim_in))
-            feat_file.close()
-
-        saved = 0
-        start = 1700
-        end = start+45
-        while saved < 45:
-            feats = sess.run(graph.get_tensor_by_name("import/Relu_1:0"), feed_dict={input: images[start:end]})
-            start = end
-            end = start+45
-            saved += 45
-
-            save_numpy_array(feats, feature_path_vgg)
-            print("PROGRESS: {}".format(saved/1745.0))
-        batches += step_size
-
 def load_dataset():
     x = load_numpy_array(feature_path_vgg)
     print x.shape
@@ -238,7 +178,12 @@ def buildWordVocab(caption_iterator, word_count_threshold=WORD_COUNT_THRESHOLD_F
     ncaps = 0
     for cap in caption_iterator:
       ncaps += 1
-      for w in emoji_tokenize(cap.decode("utf-8")):
+      # Preprocess caption text
+      cap = cap.decode("utf-8")
+      cap = re.sub('@[A-Za-z0-9_-]*', '<USER_MENTION>', cap)
+      cap = re.sub('http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\(\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+',
+                             '<URL_HERE>', cap)
+      for w in emoji_tokenize(cap):
         word_counts[w] = word_counts.get(w, 0) + 1
     vocab = [w for w in word_counts if word_counts[w] >= word_count_threshold]
     print('%d WORDS INCLUDED IN VOCAB OUT OF FOUND %d' % (len(vocab), len(word_counts)))
@@ -276,7 +221,7 @@ class InstaCaptionGeneratorTrain():
         # declare the RNN we use for caption generation
         #self.lstm = tf.contrib.rnn.BasicLSTMCell(dim_hidden)
         # 2-layer LSTM, each layer has n_hidden units.
-        self.lstm = tf.contrib.rnn.MultiRNNCell([tf.contrib.rnn.BasicLSTMCell(dim_hidden), tf.contrib.rnn.BasicLSTMCell(dim_hidden)])
+        self.lstm = tf.contrib.rnn.MultiRNNCell([tf.contrib.rnn.LayerNormBasicLSTMCell(dim_hidden,layer_norm=True), tf.contrib.rnn.LayerNormBasicLSTMCell(dim_hidden,layer_norm=True)])
 
         # declare the variables to be used to embed the image feature embedding to the word embedding space
         # (i.e. layer for going from CNN image representation to RNN which is kind of the first layer)
@@ -290,6 +235,9 @@ class InstaCaptionGeneratorTrain():
             self.word_encoding_bias = tf.Variable(init_b, name='word_encoding_bias')
         else:
             self.word_encoding_bias = tf.Variable(tf.zeros([n_words]), name='word_encoding_bias')
+
+        # Flag to know whether running training or inference
+        self.is_train = tf.placeholder(tf.bool, name="is_train")
 
 
     def build_model(self):
@@ -349,7 +297,7 @@ class InstaCaptionGeneratorTrain():
             return total_loss, img, caption_placeholder, mask
 
 
-    def build_generator(self, maxlen, batchsize=1):
+    def build_generator(self, maxlen, batchsize=1, isTrain=True):
         # same setup as `build_model` function
         img = tf.placeholder(tf.float32, [batchsize, self.dim_in])
         image_embedding = tf.matmul(img, self.img_embedding) + self.img_embedding_bias
@@ -358,7 +306,7 @@ class InstaCaptionGeneratorTrain():
         # list to hold the words of our generated captions
         all_words = []
 
-        with tf.variable_scope("RNN", reuse=True):
+        with tf.variable_scope("RNN", reuse=isTrain):
             # First pass in image embedding
             output, state = self.lstm(image_embedding, state)
 
@@ -386,6 +334,8 @@ def train(lrate=0.075, continue_training=False, transfer=True):
     tf.reset_default_graph()
 
     feats, captions = parse_vgg_data()
+    # feats = feats[:1000]
+    # captions = captions[:1000]
     wordtoix, ixtoword, init_b = buildWordVocab(captions)
     np.save(idx2word_path, ixtoword)
 
@@ -403,8 +353,11 @@ def train(lrate=0.075, continue_training=False, transfer=True):
     learning_rate = tf.train.exponential_decay(lrate, global_step, (int(len(index) / batch_size)), 0.99)
     learning_rate_const = tf.train.exponential_decay(lrate, global_step, (int(len(index) / batch_size)), 1)
     #learning_rate = tf.train.exponential_decay(learning_rate, global_step, 200, 2.0)
-    optimizer = tf.train.AdamOptimizer(learning_rate).minimize(loss, global_step=global_step)
-    optimizer_const = tf.train.AdamOptimizer(lrate).minimize(loss, global_step=global_step)
+    update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
+    with tf.control_dependencies(update_ops):
+        optimizer = tf.train.AdamOptimizer(learning_rate).minimize(loss, global_step=global_step)
+        optimizer_const = tf.train.AdamOptimizer(lrate).minimize(loss, global_step=global_step)
+
 
     saver = tf.train.Saver(max_to_keep=100)
 
@@ -423,7 +376,7 @@ def train(lrate=0.075, continue_training=False, transfer=True):
         if continue_training:
             if not transfer:
                 if True:#not tf.train.latest_checkpoint(model_path):
-                    saver.restore(sess, model_path+"/model_b")
+                    saver.restore(sess, model_path+"/model_c-30")
                 else:
                     saver.restore(sess, tf.train.latest_checkpoint(model_path))
 
@@ -435,95 +388,100 @@ def train(lrate=0.075, continue_training=False, transfer=True):
         losses_2 = []
         steps = 0
         log_step = 0
-        previously_saved_loss = 0.9
+        previously_saved_loss = 5.0
         use_adaptive_lrate = False
-        for epoch in range(n_epochs):
-            for start, end in zip(range(0, len(index), batch_size), range(batch_size, len(index), batch_size)):
-                # Get image features, captions and indices for captions
-                current_feats = feats[index[start:end]]
-                current_captions = captions[index[start:end]]
-                current_caption_ind = [x for x in map(
-                    lambda cap: [wordtoix[word] for word in cap.lower().split(' ')[:-1] if word in wordtoix],
-                    current_captions)]
+        try:
+            for epoch in range(n_epochs):
+                for start, end in zip(range(0, len(index), batch_size), range(batch_size, len(index), batch_size)):
+                    # Get image features, captions and indices for captions
+                    current_feats = feats[index[start:end]]
+                    current_captions = captions[index[start:end]]
+                    current_caption_ind = [x for x in map(
+                        lambda cap: [wordtoix[word] for word in cap.lower().split(' ')[:-1] if word in wordtoix],
+                        current_captions)]
 
-                # matrify caption indices and get mask
-                current_caption_matrix = tf.keras.preprocessing.sequence.pad_sequences(current_caption_ind, padding='post', maxlen=maxlen + 1)
-                current_caption_matrix = np.hstack(
-                    [np.full((len(current_caption_matrix), 1), 0), current_caption_matrix])
-                current_mask_matrix = np.zeros((current_caption_matrix.shape[0], current_caption_matrix.shape[1]))
-                nonzeros = np.array([x for x in map(lambda x: (x != 0).sum() + 2, current_caption_matrix)])
-                for ind, row in enumerate(current_mask_matrix):
-                    row[:nonzeros[ind]] = 1
+                    # matrify caption indices and get mask
+                    current_caption_matrix = tf.keras.preprocessing.sequence.pad_sequences(current_caption_ind, padding='post', maxlen=maxlen + 1)
+                    current_caption_matrix = np.hstack(
+                        [np.full((len(current_caption_matrix), 1), 0), current_caption_matrix])
+                    current_mask_matrix = np.zeros((current_caption_matrix.shape[0], current_caption_matrix.shape[1]))
+                    nonzeros = np.array([x for x in map(lambda x: (x != 0).sum() + 2, current_caption_matrix)])
+                    for ind, row in enumerate(current_mask_matrix):
+                        row[:nonzeros[ind]] = 1
 
-                # Train
-                if not use_adaptive_lrate:
-                    sess.run(optimizer_const, feed_dict={
+                    # Train
+                    if not use_adaptive_lrate:
+                        sess.run(optimizer_const, feed_dict={
+                            image: current_feats.astype(np.float32),
+                            sentence: current_caption_matrix.astype(np.int32),
+                            mask: current_mask_matrix.astype(np.float32)
+                        })
+                    else:
+                        sess.run(optimizer, feed_dict={
+                            image: current_feats.astype(np.float32),
+                            sentence: current_caption_matrix.astype(np.int32),
+                            mask: current_mask_matrix.astype(np.float32)
+                        })
+                    # sess.run(optimizer, feed_dict={
+                    #     image: current_feats.astype(np.float32),
+                    #     sentence: current_caption_matrix.astype(np.int32),
+                    #     mask: current_mask_matrix.astype(np.float32)
+                    # })
+
+                    # steps += 1
+                    #
+                    # if steps % 50 == 0:
+                    #     log_step += 1
+                    #     summary = sess.run(merged_summary, feed_dict={
+                    #         image: current_feats.astype(np.float32),
+                    #         sentence: current_caption_matrix.astype(np.int32),
+                    #         mask: current_mask_matrix.astype(np.float32)
+                    #     })
+                    #     file_writer.add_summary(summary, global_step=log_step)
+
+                if epoch % eval_epoch_interval == 0:
+                    loss_value = sess.run(loss, feed_dict={
                         image: current_feats.astype(np.float32),
                         sentence: current_caption_matrix.astype(np.int32),
                         mask: current_mask_matrix.astype(np.float32)
                     })
-                else:
-                    sess.run(optimizer, feed_dict={
-                        image: current_feats.astype(np.float32),
-                        sentence: current_caption_matrix.astype(np.int32),
-                        mask: current_mask_matrix.astype(np.float32)
-                    })
-                # sess.run(optimizer, feed_dict={
-                #     image: current_feats.astype(np.float32),
-                #     sentence: current_caption_matrix.astype(np.int32),
-                #     mask: current_mask_matrix.astype(np.float32)
-                # })
+                    # summary = sess.run(merged_summary, feed_dict={
+                    #     image: current_feats.astype(np.float32),
+                    #     sentence: current_caption_matrix.astype(np.int32),
+                    #     mask: current_mask_matrix.astype(np.float32)
+                    # })
+                    losses.append(int(loss_value))
+                    losses_2.append(loss_value)
 
-                # steps += 1
-                #
-                # if steps % 50 == 0:
-                #     log_step += 1
-                #     summary = sess.run(merged_summary, feed_dict={
-                #         image: current_feats.astype(np.float32),
-                #         sentence: current_caption_matrix.astype(np.int32),
-                #         mask: current_mask_matrix.astype(np.float32)
-                #     })
-                #     file_writer.add_summary(summary, global_step=log_step)
+                    # file_writer.add_summary(summary, global_step=epoch)
+                    print("Current Cost: ", loss_value, "\t Epoch {}/{}".format(epoch, n_epochs))
 
-            if epoch % eval_epoch_interval == 0:
-                loss_value = sess.run(loss, feed_dict={
-                    image: current_feats.astype(np.float32),
-                    sentence: current_caption_matrix.astype(np.int32),
-                    mask: current_mask_matrix.astype(np.float32)
-                })
-                summary = sess.run(merged_summary, feed_dict={
-                    image: current_feats.astype(np.float32),
-                    sentence: current_caption_matrix.astype(np.int32),
-                    mask: current_mask_matrix.astype(np.float32)
-                })
-                losses.append(int(loss_value))
-                losses_2.append(loss_value)
+                    # Test and generate text with model 3 times
+                    for i in range(3):
+                        rnd_idx = random.sample(index, 1)
+                        X = feats[rnd_idx]
+                        Y = captions[rnd_idx]
+                        max_gen_len = 15
+                        test_im, generated_words = caption_generator.build_generator(maxlen=max_gen_len, batchsize=1)
+                        generated_word_index = sess.run(generated_words, feed_dict={test_im: X})
+                        generated_word_index = np.hstack(generated_word_index)
+                        generated_words = [ixtoword[x] for x in generated_word_index]
+                        #generated_words = [w for w in generated_words if w != "."]
+                        generated_sentence = ' '.join(generated_words)
+                        print("ACTUAL: {}\nPREDICTED: {}\n".format(Y, generated_sentence))
 
-                file_writer.add_summary(summary, global_step=epoch)
-                print("Current Cost: ", loss_value, "\t Epoch {}/{}".format(epoch, n_epochs))
+                    # if len(losses) >= 10 and all(elem == losses[-1] for elem in losses[:-10:-1]):
+                    #     use_adaptive_lrate = True
 
-                # Test and generate text with model 3 times
-                for i in range(3):
-                    rnd_idx = random.sample(index, 1)
-                    X = feats[rnd_idx]
-                    Y = captions[rnd_idx]
-                    max_gen_len = 15
-                    test_im, generated_words = caption_generator.build_generator(maxlen=max_gen_len, batchsize=1)
-                    generated_word_index = sess.run(generated_words, feed_dict={test_im: X})
-                    generated_word_index = np.hstack(generated_word_index)
-                    generated_words = [ixtoword[x] for x in generated_word_index]
-                    generated_words = [w for w in generated_words if w != "."]
-                    generated_sentence = ' '.join(generated_words)
-                    print("ACTUAL: {}\nPREDICTED: {}\n".format(Y, generated_sentence))
-
-                # if len(losses) >= 10 and all(elem == losses[-1] for elem in losses[:-10:-1]):
-                #     use_adaptive_lrate = True
-
-            if epoch % 5 == 0 and loss_value <= previously_saved_loss:
-                print("Saving the model from epoch: ", epoch)
-                #saver.save(sess, os.path.join(model_path, 'model'), global_step=epoch)
-                saver.save(sess, os.path.join(model_path, 'model_b'))
-                previously_saved_loss = loss_value
+                if epoch % 5 == 0 and loss_value <= previously_saved_loss and epoch >= 20:
+                    print("Saving the model from epoch: ", epoch)
+                    saver.save(sess, os.path.join(model_path, 'model_d'), global_step=epoch)
+                    #saver.save(sess, os.path.join(model_path, 'model_c'))
+                    previously_saved_loss = loss_value
+        except KeyboardInterrupt:
+            answer = raw_input("Keyboard Interrupt\n(S)ave model or (I)gnore?\n")
+            if answer.lower() == 's':
+                saver.save(sess, os.path.join(model_path, 'model_c2'))
 
 
 def run_training_loop():
@@ -535,7 +493,7 @@ def run_training_loop():
         print('Exiting Training')
 
 def generate_caption_for_image_with_path(image_path, max_gen_len=15):
-    if not os.path.exists('data/insta_ixtoword.npy'):
+    if not os.path.exists(idx2word_path):
         print ('You must run a training loop for at least one epoch first.')
     else:
         tf.reset_default_graph()
@@ -557,7 +515,7 @@ def generate_caption_for_image_with_path(image_path, max_gen_len=15):
         sess = tf.InteractiveSession(graph=graph)
         caption_generator = InstaCaptionGeneratorTrain(dim_in, dim_hidden, dim_embed, 1, max_gen_len + 2, n_words)
         graph = tf.get_default_graph()
-        image, generated_words = caption_generator.build_generator(maxlen=max_gen_len)
+        image, generated_words = caption_generator.build_generator(maxlen=max_gen_len, isTrain=False)
 
         im = load_image(image_path,224)
         im = np.array([im])
@@ -568,8 +526,7 @@ def generate_caption_for_image_with_path(image_path, max_gen_len=15):
         # Load model graph
         # saved_path = tf.train.latest_checkpoint(model_path)
         # saver.restore(sess, saved_path)
-        saver.restore(sess, model_path + "/model_a")
-
+        saver.restore(sess, model_path + "/model_d")
 
         generated_word_index = sess.run(generated_words, feed_dict={image: feat})
         generated_word_index = np.hstack(generated_word_index)
@@ -580,7 +537,7 @@ def generate_caption_for_image_with_path(image_path, max_gen_len=15):
         print(generated_sentence)
 
 if __name__ == "__main__":
-    #generate_caption_for_image_with_path("data/images/insta_5.jpg")
+    generate_caption_for_image_with_path("data/images/custom_h.jpg", max_gen_len=15)
 
 
     #create_vgg_dataset("/Users/Odie/Downloads/instagram-scraper-master/instagram_scraper/foodposts")
@@ -596,4 +553,4 @@ if __name__ == "__main__":
     # feats, caps = parse_vgg_data()
     # buildWordVocab(caps)
 
-    run_training_loop()
+    #run_training_loop()
