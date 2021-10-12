@@ -28,7 +28,7 @@ networkx==2.2
 nltk==3.2.5
 numexpr==2.7.0
 numpy==1.16.5
-opencv-python==4.1.1.26
+opencv-python==4.2.0.32
 pandas==0.24.2
 Pillow==6.1.0
 protobuf==3.9.1
